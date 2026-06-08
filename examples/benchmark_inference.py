@@ -159,14 +159,16 @@ def run_jax_inference(
 
     for _ in range(warmup):
         outputs = apply_fn(params, batch_jax)
-        jax.block_until_ready(outputs['energy'])
+        jax.block_until_ready(outputs)  # block the full output tree (energy+forces+stress),
+        # not just energy, so the backward (forces/stress) is included in the timing
 
     timings: list[float] = []
     outputs: dict[str, Any] | None = None
     for _ in range(repeats):
         start = time.perf_counter()
         outputs = apply_fn(params, batch_jax)
-        jax.block_until_ready(outputs['energy'])
+        jax.block_until_ready(outputs)  # block the full output tree (energy+forces+stress),
+        # not just energy, so the backward (forces/stress) is included in the timing
         timings.append(time.perf_counter() - start)
 
     assert outputs is not None
