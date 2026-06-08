@@ -42,7 +42,7 @@ def load_foundation_model(
 
     loader_kwargs: dict[str, Any] = {'device': device}
     model = load_foundation_torch_model(
-        source=source_lower,
+        source=source.lower(),
         model=variant,
         device=loader_kwargs['device'],
     )
@@ -105,6 +105,11 @@ def run_torch_inference(
     compute_stress: bool,
 ) -> tuple[BenchmarkResult, dict[str, torch.Tensor]]:
     grad_ctx = torch.enable_grad if (compute_force or compute_stress) else torch.no_grad
+
+    # Current mace (>= commit 38a21f8) expects a dict-like input (data.get(...));
+    # the torch_geometric Batch has no .get, so feed the model a plain dict.
+    if hasattr(batch, 'to_dict'):
+        batch = batch.to_dict()
 
     for _ in range(warmup):
         with grad_ctx():
