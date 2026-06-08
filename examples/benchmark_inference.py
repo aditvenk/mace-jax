@@ -12,7 +12,6 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from ase.build import bulk
-from flax import nnx
 from mace.data.atomic_data import AtomicData
 from mace.data.utils import config_from_atoms
 from mace.tools import torch_geometric
@@ -94,6 +93,68 @@ def prepare_batches(
     return batch_torch, batch_jax, config
 
 
+class CompiledMaceInference:
+    """Minimal MACE inference wrapper with all torch.compile + CUDA-graph optimizations,
+    using the benchmark's precomputed (static) neighbor list.
+
+    (1) rebuild via prepare(extract_model) so a loaded foundation model's e3nn modules
+        compile (avoids the Irrep dynamo-guard crash);
+    (2) configure_autograd_for_compile (allow_in_graph(autograd.grad) + trace_autograd_ops)
+        so the inner force autograd.grad traces into the graph, AND mace's retain_graph fix
+        (retain_graph kept alive while compiling) so compiled inference (training=False)
+        doesn't fail with "backward through the graph a second time";
+    (3) torch.compile(mode="reduce-overhead", fullgraph=True);
+    (4) per-call fresh input leaves (positions/cell) so the strain-derived intermediates the
+        retained backward references can't be overwritten in the static cudagraph pool across
+        steps (this also removes any input mutation, so no cudagraph_support_input_mutation);
+    (5) cudagraph_mark_step_begin() each step;
+    (6) detached+cloned outputs so no grad-requiring tensor is held across steps."""
+
+    def __init__(self, model, compile_mode, device, *,
+                 compute_force=True, compute_stress=True, cueq=False):
+        import torch._dynamo as dynamo
+        from mace.tools.compile import (
+            configure_autograd_for_compile,
+            disable_e3nn_codegen,
+            prepare,
+            simplify,
+        )
+        from mace.tools.scripts_utils import extract_model
+
+        self.compute_force = compute_force
+        self.compute_stress = compute_stress
+        self.use_cudagraphs = compile_mode in ('reduce-overhead', 'max-autotune')
+        # No cudagraph_support_input_mutation needed: per-call fresh input leaves
+        # (see __call__) mean the graph never mutates a re-fed input across steps.
+        configure_autograd_for_compile(allow_autograd=True)
+        dynamo.config.error_on_recompile = True
+        with disable_e3nn_codegen():
+            # cueq modules can't be rebuilt by extract_model, so just simplify in place
+            # (like MACECalculator); plain e3nn rebuilds fresh.
+            prepared = (simplify(model) if cueq
+                        else prepare(extract_model)(model=model, map_location=device))
+        self.model = torch.compile(prepared, mode=compile_mode, fullgraph=True)
+
+    def __call__(self, batch):
+        data = batch.to_dict() if hasattr(batch, 'to_dict') else dict(batch)
+        # fresh input leaves each step: forces/stress need leaves, and a fresh buffer keeps
+        # the strain mutation from clobbering the static cudagraph pool across replays.
+        data['positions'] = data['positions'].detach().clone().requires_grad_(True)
+        if 'cell' in data and torch.is_tensor(data['cell']):
+            data['cell'] = data['cell'].detach().clone()
+        if self.use_cudagraphs:
+            torch.compiler.cudagraph_mark_step_begin()
+        with torch.enable_grad():
+            out = self.model(
+                data,
+                compute_force=self.compute_force,
+                compute_stress=self.compute_stress,
+                training=False,
+            )
+        return {k: (v.detach().clone() if torch.is_tensor(v) else v)
+                for k, v in out.items()}
+
+
 def run_torch_inference(
     model: torch.nn.Module,
     batch: Batch,
@@ -134,7 +195,9 @@ def run_torch_inference(
     assert outputs is not None
     arr = np.array(timings)
     stats = BenchmarkResult(
-        mean=float(arr.mean()), std=float(arr.std()), min_time=float(arr.min())
+        mean=float(arr.mean()),
+        std=float(arr.std()),
+        min_time=float(arr.min()),
     )
     return stats, outputs
 
@@ -174,7 +237,9 @@ def run_jax_inference(
     assert outputs is not None
     arr = np.array(timings)
     stats = BenchmarkResult(
-        mean=float(arr.mean()), std=float(arr.std()), min_time=float(arr.min())
+        mean=float(arr.mean()),
+        std=float(arr.std()),
+        min_time=float(arr.min()),
     )
     return stats, outputs
 
@@ -216,10 +281,30 @@ def main() -> None:
         action='store_true',
         help='Enable cuequivariance conv fusion in the converted JAX model.',
     )
+    parser.add_argument(
+        '--cueq',
+        action='store_true',
+        help='Use cuequivariance kernels on BOTH backends (torch via run_e3nn_to_cueq, '
+        'JAX via enabled CuEquivarianceConfig).',
+    )
+    parser.add_argument(
+        '--torch-compile',
+        default='none',
+        choices=['none', 'default', 'reduce-overhead', 'max-autotune',
+                 'max-autotune-no-cudagraphs'],
+        help='Enable torch compile. Needs mace with the retain_graph fix so the '
+        'inner force autograd.grad traces under AOTAutograd.',
+    )
     args = parser.parse_args()
 
     compute_force = not args.disable_forces
     compute_stress = not args.disable_stress
+
+    # Apples-to-apples precision: pin both frameworks to full fp32 matmuls. Torch
+    # already defaults to allow_tf32=False ("highest"); JAX's default would otherwise
+    # use TF32-class fp32 (~5% faster, lower precision), an unfair edge.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    jax.config.update('jax_default_matmul_precision', 'highest')
 
     torch_device = configure_torch_runtime(get_torch_device(), deterministic=False)
     print(f'Torch device: {torch_device}')
@@ -232,24 +317,28 @@ def main() -> None:
     atoms = build_example_atoms(args.symbol, args.repeat)
     batch_torch, batch_jax, config = prepare_batches(torch_model, atoms, torch_device)
 
+    run_compiled = args.torch_compile != 'none'
+
+    # Build the JAX graph from the ORIGINAL e3nn model first (the cue-jax modules are
+    # built from it via cueq_config); only after that may we convert the torch model to
+    # cueq in-place for the torch backends.
     cue_config: CuEquivarianceConfig | None = None
-    if args.cue_conv_fusion:
-        # Leave ``enabled`` false so only the tensor-product path switches to cue
-        # for conv fusion while symmetric contractions remain on pure JAX, matching
-        # the behaviour of the Torch wrapper.
+    if args.cueq:
         cue_config = CuEquivarianceConfig(
-            enabled=False,
-            optimize_channelwise=True,
-            conv_fusion=True,
+            enabled=True, optimize_all=True, conv_fusion=True,
+            group='O3', layout='mul_ir',
+        )
+    elif args.cue_conv_fusion:
+        cue_config = CuEquivarianceConfig(
+            enabled=False, optimize_channelwise=True, conv_fusion=True,
             layout='mul_ir',
         )
+    graphdef, state, _ = convert_model(torch_model, config, cueq_config=cue_config)
+    jax_params = state_to_pure_dict(state)
 
-    graphdef, state, _ = convert_model(
-        torch_model,
-        config,
-        cueq_config=cue_config,
-    )
-    params = state_to_pure_dict(state)
+    if args.cueq:
+        from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
+        torch_model = run_e3nn_to_cueq(torch_model, device=torch_device).to(torch_device)
 
     torch_stats, torch_outputs = run_torch_inference(
         torch_model,
@@ -260,14 +349,40 @@ def main() -> None:
         compute_force=compute_force,
         compute_stress=compute_stress,
     )
-    print('Torch inference (per call):')
+    print('Torch (eager) inference (per call):')
     print(
         f'  mean = {torch_stats.mean * 1e3:.2f} ms  std = {torch_stats.std * 1e3:.2f} ms  min = {torch_stats.min_time * 1e3:.2f} ms'
     )
 
+    if run_compiled:
+        wrapper = CompiledMaceInference(
+            torch_model, args.torch_compile, torch_device,
+            compute_force=compute_force, compute_stress=compute_stress,
+            cueq=args.cueq,
+        )
+        for _ in range(max(args.warmup, 8)):  # warmup / compile / cudagraph record
+            wrapper(batch_torch)
+            if torch_device.type == 'cuda':
+                torch.cuda.synchronize(torch_device)
+        ctimes: list[float] = []
+        for _ in range(args.repeats):
+            start = time.perf_counter()
+            wrapper(batch_torch)
+            if torch_device.type == 'cuda':
+                torch.cuda.synchronize(torch_device)
+            ctimes.append(time.perf_counter() - start)
+        carr = np.array(ctimes)
+        compiled_stats = BenchmarkResult(
+            mean=float(carr.mean()), std=float(carr.std()), min_time=float(carr.min()),
+        )
+        print(f'Torch (compiled: {args.torch_compile}, cudagraphs={wrapper.use_cudagraphs}) inference (per call):')
+        print(
+            f'  mean = {compiled_stats.mean * 1e3:.2f} ms  std = {compiled_stats.std * 1e3:.2f} ms  min = {compiled_stats.min_time * 1e3:.2f} ms'
+        )
+
     jax_stats, jax_outputs = run_jax_inference(
         graphdef,
-        params,
+        jax_params,
         batch_jax,
         repeats=args.repeats,
         warmup=args.warmup,
