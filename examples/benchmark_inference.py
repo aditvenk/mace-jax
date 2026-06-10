@@ -295,16 +295,27 @@ def main() -> None:
         help='Enable torch compile. Needs mace with the retain_graph fix so the '
         'inner force autograd.grad traces under AOTAutograd.',
     )
+    parser.add_argument(
+        '--tf32',
+        action='store_true',
+        help='Enable TF32-class matmuls on BOTH frameworks (faster, lower precision). '
+        'Default pins full fp32 on both for apples-to-apples precision.',
+    )
     args = parser.parse_args()
 
     compute_force = not args.disable_forces
     compute_stress = not args.disable_stress
 
-    # Apples-to-apples precision: pin both frameworks to full fp32 matmuls. Torch
-    # already defaults to allow_tf32=False ("highest"); JAX's default would otherwise
-    # use TF32-class fp32 (~5% faster, lower precision), an unfair edge.
-    torch.backends.cuda.matmul.allow_tf32 = False
-    jax.config.update('jax_default_matmul_precision', 'highest')
+    # Precision: keep both frameworks matched. Default pins full fp32 matmuls; --tf32
+    # enables TF32-class matmuls on both (Ampere+ tensor cores, ~lower precision).
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+        jax.config.update('jax_default_matmul_precision', 'high')
+    else:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        jax.config.update('jax_default_matmul_precision', 'highest')
 
     torch_device = configure_torch_runtime(get_torch_device(), deterministic=False)
     print(f'Torch device: {torch_device}')
