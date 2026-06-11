@@ -4,7 +4,6 @@ import argparse
 import time
 from dataclasses import dataclass
 from typing import Any
-from mace_jax.nnx_utils import state_to_pure_dict
 
 import ase
 import jax
@@ -20,7 +19,7 @@ from mace.tools.scripts_utils import extract_config_mace_model
 from mace.tools.torch_geometric.batch import Batch
 
 from mace_jax.cli.mace_jax_from_torch import convert_model
-from mace_jax.modules.wrapper_ops import CuEquivarianceConfig
+from mace_jax.nnx_utils import state_to_pure_dict
 from mace_jax.tools.device import configure_torch_runtime, get_torch_device
 from mace_jax.tools.foundation_models import load_foundation_torch_model
 
@@ -123,7 +122,7 @@ class CompiledMaceInference:
 
         self.compute_force = compute_force
         self.compute_stress = compute_stress
-        self.use_cudagraphs = compile_mode in ('reduce-overhead', 'max-autotune')
+        self.use_cudagraphs = compile_mode == 'reduce-overhead'
         # No cudagraph_support_input_mutation needed: per-call fresh input leaves
         # (see __call__) mean the graph never mutates a re-fed input across steps.
         configure_autograd_for_compile(allow_autograd=True)
@@ -267,55 +266,29 @@ def main() -> None:
         '--warmup', type=int, default=3, help='Number of warmup runs before timing.'
     )
     parser.add_argument(
-        '--disable-forces',
+        '--compact-naive',
         action='store_true',
-        help='Skip force computation in the benchmark.',
-    )
-    parser.add_argument(
-        '--disable-stress',
-        action='store_true',
-        help='Skip stress computation in the benchmark.',
-    )
-    parser.add_argument(
-        '--cue-conv-fusion',
-        action='store_true',
-        help='Enable cuequivariance conv fusion in the converted JAX model.',
-    )
-    parser.add_argument(
-        '--cueq',
-        action='store_true',
-        help='Use cuequivariance kernels on BOTH backends (torch via run_e3nn_to_cueq, '
-        'JAX via enabled CuEquivarianceConfig).',
+        help='Convert the Torch model to cueq method="naive" and route it '
+        'through the compact path-batched pure-ATen lowering. JAX remains on '
+        'the default converted model.',
     )
     parser.add_argument(
         '--torch-compile',
         default='none',
-        choices=['none', 'default', 'reduce-overhead', 'max-autotune',
-                 'max-autotune-no-cudagraphs'],
+        choices=['none', 'default', 'reduce-overhead'],
         help='Enable torch compile. Needs mace with the retain_graph fix so the '
         'inner force autograd.grad traces under AOTAutograd.',
     )
-    parser.add_argument(
-        '--tf32',
-        action='store_true',
-        help='Enable TF32-class matmuls on BOTH frameworks (faster, lower precision). '
-        'Default pins full fp32 on both for apples-to-apples precision.',
-    )
     args = parser.parse_args()
 
-    compute_force = not args.disable_forces
-    compute_stress = not args.disable_stress
+    compute_force = True
+    compute_stress = True
 
-    # Precision: keep both frameworks matched. Default pins full fp32 matmuls; --tf32
-    # enables TF32-class matmuls on both (Ampere+ tensor cores, ~lower precision).
-    if args.tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision('high')
-        jax.config.update('jax_default_matmul_precision', 'high')
-    else:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        jax.config.update('jax_default_matmul_precision', 'highest')
+    # Fixed benchmark precision: full fp32 matmuls on both frameworks.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision('highest')
+    jax.config.update('jax_default_matmul_precision', 'highest')
 
     torch_device = configure_torch_runtime(get_torch_device(), deterministic=False)
     print(f'Torch device: {torch_device}')
@@ -330,26 +303,19 @@ def main() -> None:
 
     run_compiled = args.torch_compile != 'none'
 
-    # Build the JAX graph from the ORIGINAL e3nn model first (the cue-jax modules are
-    # built from it via cueq_config); only after that may we convert the torch model to
-    # cueq in-place for the torch backends.
-    cue_config: CuEquivarianceConfig | None = None
-    if args.cueq:
-        cue_config = CuEquivarianceConfig(
-            enabled=True, optimize_all=True, conv_fusion=True,
-            group='O3', layout='mul_ir',
-        )
-    elif args.cue_conv_fusion:
-        cue_config = CuEquivarianceConfig(
-            enabled=False, optimize_channelwise=True, conv_fusion=True,
-            layout='mul_ir',
-        )
-    graphdef, state, _ = convert_model(torch_model, config, cueq_config=cue_config)
+    # Build the JAX graph from the original e3nn checkpoint. The compact lowering
+    # is a Torch-side rewrite only, so JAX remains the default converted model.
+    graphdef, state, _ = convert_model(torch_model, config, cueq_config=None)
     jax_params = state_to_pure_dict(state)
 
-    if args.cueq:
+    if args.compact_naive:
         from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
-        torch_model = run_e3nn_to_cueq(torch_model, device=torch_device).to(torch_device)
+
+        torch_model = run_e3nn_to_cueq(
+            torch_model,
+            device=torch_device,
+            compact_naive=True,
+        ).to(torch_device)
 
     torch_stats, torch_outputs = run_torch_inference(
         torch_model,
@@ -369,7 +335,7 @@ def main() -> None:
         wrapper = CompiledMaceInference(
             torch_model, args.torch_compile, torch_device,
             compute_force=compute_force, compute_stress=compute_stress,
-            cueq=args.cueq,
+            cueq=args.compact_naive,
         )
         for _ in range(max(args.warmup, 8)):  # warmup / compile / cudagraph record
             wrapper(batch_torch)
